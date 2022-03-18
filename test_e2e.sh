@@ -110,8 +110,9 @@ function clean_work() {
     mkdir -p "$WORK"
 }
 
-# REPO is the source repo under test.
+# REPO and REPO2 are the source repos under test.
 REPO="$DIR/repo"
+REPO2="${REPO}2"
 MAIN_BRANCH="e2e-branch"
 function init_repo() {
     rm -rf "$REPO"
@@ -120,6 +121,9 @@ function init_repo() {
     touch "$REPO"/file
     git -C "$REPO" add file
     git -C "$REPO" commit -aqm "init file"
+
+    rm -rf "$REPO2"
+    cp -r "$REPO" "$REPO2"
 }
 
 # ROOT is the volume (usually) used as --root.
@@ -156,6 +160,7 @@ function GIT_SYNC() {
         -u $(id -u):$(id -g) \
         -v "$ROOT":"$ROOT":rw \
         -v "$REPO":"$REPO":ro \
+        -v "$REPO2":"$REPO2":ro \
         -v "$WORK":"$WORK":ro \
         -v "$(pwd)/slow_git_clone.sh":"$SLOW_GIT_CLONE":ro \
         -v "$(pwd)/slow_git_fetch.sh":"$SLOW_GIT_FETCH":ro \
@@ -684,6 +689,43 @@ function e2e::crash_cleanup_retry() {
     assert_link_exists "$ROOT"/link
     assert_file_exists "$ROOT"/link/file
     assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+}
+
+##############################################
+# Test changing repos with storage intact
+##############################################
+function e2e::change_repos_after_sync() {
+    # Prepare first repo
+    echo "$FUNCNAME 1" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 1"
+
+    # First sync
+    GIT_SYNC \
+        --repo="file://$REPO" \
+        --branch="$MAIN_BRANCH" \
+        --root="$ROOT" \
+        --dest="link" \
+        --one-time \
+        >> "$1" 2>&1
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+
+    # Prepare other repo
+    echo "$FUNCNAME 2" > "$REPO2"/file
+    git -C "$REPO2" commit -qam "$FUNCNAME 2"
+
+    # Now sync the other repo
+    GIT_SYNC \
+        --repo="file://$REPO2" \
+        --branch="$MAIN_BRANCH" \
+        --root="$ROOT" \
+        --dest="link" \
+        --one-time \
+        >> "$1" 2>&1
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 2"
 }
 
 ##############################################
@@ -1729,6 +1771,90 @@ function e2e::github_https() {
     assert_file_exists "$ROOT"/link/LICENSE
 }
 
+##############################################
+# Test git-gc=auto
+##############################################
+function e2e::gc_auto() {
+    echo "$FUNCNAME" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME"
+
+    GIT_SYNC \
+        --one-time \
+        --repo="file://$REPO" \
+        --branch="$MAIN_BRANCH" \
+        --rev=HEAD \
+        --root="$ROOT" \
+        --dest="link" \
+        --git-gc="auto" \
+        >> "$1" 2>&1
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME"
+}
+
+##############################################
+# Test git-gc=always
+##############################################
+function e2e::gc_always() {
+    echo "$FUNCNAME" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME"
+
+    GIT_SYNC \
+        --one-time \
+        --repo="file://$REPO" \
+        --branch="$MAIN_BRANCH" \
+        --rev=HEAD \
+        --root="$ROOT" \
+        --dest="link" \
+        --git-gc="always" \
+        >> "$1" 2>&1
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME"
+}
+
+##############################################
+# Test git-gc=aggressive
+##############################################
+function e2e::gc_aggressive() {
+    echo "$FUNCNAME" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME"
+
+    GIT_SYNC \
+        --one-time \
+        --repo="file://$REPO" \
+        --branch="$MAIN_BRANCH" \
+        --rev=HEAD \
+        --root="$ROOT" \
+        --dest="link" \
+        --git-gc="aggressive" \
+        >> "$1" 2>&1
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME"
+}
+
+##############################################
+# Test git-gc=off
+##############################################
+function e2e::gc_off() {
+    echo "$FUNCNAME" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME"
+
+    GIT_SYNC \
+        --one-time \
+        --repo="file://$REPO" \
+        --branch="$MAIN_BRANCH" \
+        --rev=HEAD \
+        --root="$ROOT" \
+        --dest="link" \
+        --git-gc="off" \
+        >> "$1" 2>&1
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME"
+}
+
 function list_tests() {
     (
         shopt -s extdebug
@@ -1743,35 +1869,53 @@ function list_tests() {
 }
 
 # Figure out which, if any, tests to run.
-tests=($(list_tests))
+all_tests=($(list_tests))
+tests_to_run=()
 
 function print_tests() {
     echo "available tests:"
-    for t in "${tests[@]}"; do
+    for t in "${all_tests[@]}"; do
         echo "    $t"
     done
 }
 
-for t; do
+# Validate and accumulate tests to run if args are specified.
+for arg; do
     # Use -? to list known tests.
-    if [[ "${t}" == "-?" ]]; then
+    if [[ "${arg}" == "-?" ]]; then
         print_tests
         exit 0
     fi
-    # Make sure we know this test.
-    if [[ " ${tests[*]} " =~ " ${t} " ]]; then
-        continue
+    if [[ "${arg}" =~ ^- ]]; then
+        echo "ERROR: unknown flag '${arg}'"
+        exit 1
     fi
-    # Not a known test or flag.
-    echo "ERROR: unknown test or flag: '${t}'"
-    echo
-    print_tests
-    exit 1
+    # Make sure each non-flag arg matches at least one test.
+    nmatches=0
+    for t in "${all_tests[@]}"; do
+        if [[ "${t}" =~ ${arg} ]]; then
+            nmatches=$((nmatches+1))
+            # Don't run tests twice, just keep the first match.
+            if [[ " ${tests_to_run[*]} " =~ " ${t} " ]]; then
+                continue
+            fi
+            tests_to_run+=("${t}")
+            continue
+        fi
+    done
+    if [[ ${nmatches} == 0 ]]; then
+        echo "ERROR: no tests match pattern '${arg}'"
+        echo
+        print_tests
+        exit 1
+    fi
+    tests_to_run+=("${matches[@]}")
 done
+set -- "${tests_to_run[@]}"
 
-# If no tests specified, run them all.
+# If no tests were specified, run them all.
 if [[ "$#" == 0 ]]; then
-    set -- "${tests[@]}"
+    set -- "${all_tests[@]}"
 fi
 
 # Build it
