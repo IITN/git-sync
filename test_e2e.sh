@@ -73,9 +73,13 @@ function assert_file_contains() {
 
 # Helper: run a docker container.
 function docker_run() {
+    RM="--rm"
+    if [[ "${CLEANUP:-}" == 0 ]]; then
+        RM=""
+    fi
     docker run \
         -d \
-        --rm \
+        ${RM} \
         --label git-sync-e2e="$RUNID" \
         "$@"
     sleep 2 # wait for it to come up
@@ -97,6 +101,10 @@ function docker_kill() {
     fi
     docker kill "$1" >/dev/null
 }
+
+# E2E_TAG is the tag used for docker builds.  This is needed because docker
+# tags are system-global, but one might have multiple repos checked out.
+E2E_TAG=$(git rev-parse --show-toplevel | sed 's|/|_|g')
 
 # DIR is the directory in which all this test's state lives.
 RUNID="${RANDOM}${RANDOM}"
@@ -146,15 +154,21 @@ EXECHOOK_COMMAND=/test_exechook_command.sh
 EXECHOOK_COMMAND_FAIL=/test_exechook_command_fail.sh
 EXECHOOK_COMMAND_SLEEPY=/test_exechook_command_with_sleep.sh
 EXECHOOK_COMMAND_FAIL_SLEEPY=/test_exechook_command_fail_with_sleep.sh
+EXECHOOK_ENVKEY=ENVKEY
+EXECHOOK_ENVVAL=envval
 RUNLOG="$DIR/runlog.exechook-fail-retry"
 rm -f $RUNLOG
 touch $RUNLOG
 
 function GIT_SYNC() {
     #./bin/linux_amd64/git-sync "$@"
+    RM="--rm"
+    if [[ "${CLEANUP:-}" == 0 ]]; then
+        RM=""
+    fi
     docker run \
         -i \
-        --rm \
+        ${RM} \
         --label git-sync-e2e="$RUNID" \
         --network="host" \
         -u $(id -u):$(id -g) \
@@ -169,12 +183,12 @@ function GIT_SYNC() {
         -v "$(pwd)/test_exechook_command_fail.sh":"$EXECHOOK_COMMAND_FAIL":ro \
         -v "$(pwd)/test_exechook_command_with_sleep.sh":"$EXECHOOK_COMMAND_SLEEPY":ro \
         -v "$(pwd)/test_exechook_command_fail_with_sleep.sh":"$EXECHOOK_COMMAND_FAIL_SLEEPY":ro \
+        --env "$EXECHOOK_ENVKEY=$EXECHOOK_ENVVAL" \
         -v "$RUNLOG":/var/log/runs \
         -v "$DOT_SSH/id_test":"/etc/git-secret/ssh":ro \
-        --env XDG_CONFIG_HOME=$DIR \
-        e2e/git-sync:$(make -s version)__$(go env GOOS)_$(go env GOARCH) \
+        e2e/git-sync:"${E2E_TAG}"__$(go env GOOS)_$(go env GOARCH) \
             --add-user \
-            --v=5 \
+            --v=6 \
             "$@"
 }
 
@@ -214,7 +228,7 @@ function e2e::head_once() {
 ##############################################
 # Test non-zero exit
 ##############################################
-function e2e::non_zero_exit() {
+function e2e::error_non_zero_exit() {
     echo "$FUNCNAME" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME"
     (
@@ -239,7 +253,7 @@ function e2e::non_zero_exit() {
 ##############################################
 # Test HEAD one-time with an absolute-path link
 ##############################################
-function e2e::absolute_dest() {
+function e2e::sync_absolute_dest() {
     echo "$FUNCNAME" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME"
 
@@ -260,7 +274,7 @@ function e2e::absolute_dest() {
 ##############################################
 # Test HEAD one-time with a subdir-path link
 ##############################################
-function e2e::subdir_dest() {
+function e2e::sync_subdir_dest() {
     echo "$FUNCNAME" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME"
 
@@ -281,7 +295,7 @@ function e2e::subdir_dest() {
 ##############################################
 # Test default syncing (master)
 ##############################################
-function e2e::default_sync_master() {
+function e2e::sync_default_branch() {
     # First sync
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -317,7 +331,7 @@ function e2e::default_sync_master() {
 ##############################################
 # Test HEAD syncing
 ##############################################
-function e2e::head_sync() {
+function e2e::sync_head() {
     # First sync
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -419,7 +433,7 @@ function e2e::readlink() {
 ##############################################
 # Test branch syncing
 ##############################################
-function e2e::branch_sync() {
+function e2e::sync_named_branch() {
     OTHER_BRANCH="other-branch"
     # First sync
     git -C "$REPO" checkout -q -b "$OTHER_BRANCH"
@@ -462,7 +476,7 @@ function e2e::branch_sync() {
 ##############################################
 # Test switching branch after depth=1 checkout
 ##############################################
-function e2e::branch_switch() {
+function e2e::sync_branch_switch() {
     echo "$FUNCNAME" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME"
 
@@ -500,7 +514,7 @@ function e2e::branch_switch() {
 ##############################################
 # Test tag syncing
 ##############################################
-function e2e::tag_sync() {
+function e2e::sync_tag() {
     TAG="e2e-tag"
 
     # First sync
@@ -550,7 +564,7 @@ function e2e::tag_sync() {
 ##############################################
 # Test tag syncing with annotated tags
 ##############################################
-function e2e::tag_sync_annotated() {
+function e2e::sync_annotated_tag() {
     TAG="e2e-tag"
 
     # First sync
@@ -600,7 +614,7 @@ function e2e::tag_sync_annotated() {
 ##############################################
 # Test rev syncing
 ##############################################
-function e2e::rev_sync() {
+function e2e::sync_sha() {
     # First sync
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -638,7 +652,7 @@ function e2e::rev_sync() {
 ##############################################
 # Test rev-sync one-time
 ##############################################
-function e2e::rev_once() {
+function e2e::sync_sha_once() {
     echo "$FUNCNAME" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME"
     REV=$(git -C "$REPO" rev-list -n1 HEAD)
@@ -659,7 +673,7 @@ function e2e::rev_once() {
 ##############################################
 # Test syncing after a crash
 ##############################################
-function e2e::crash_cleanup_retry() {
+function e2e::sync_crash_cleanup_retry() {
     # First sync
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -694,7 +708,7 @@ function e2e::crash_cleanup_retry() {
 ##############################################
 # Test changing repos with storage intact
 ##############################################
-function e2e::change_repos_after_sync() {
+function e2e::sync_repo_switch() {
     # Prepare first repo
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -729,9 +743,9 @@ function e2e::change_repos_after_sync() {
 }
 
 ##############################################
-# Test sync loop timeout
+# Test with slow git, short timeout
 ##############################################
-function e2e::sync_loop_timeout() {
+function e2e::error_slow_git_short_timeout() {
     # First sync
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -747,6 +761,15 @@ function e2e::sync_loop_timeout() {
         >> "$1" 2>&1 || true
     # check for failure
     assert_file_absent "$ROOT"/link/file
+}
+
+##############################################
+# Test with slow git, long timeout
+##############################################
+function e2e::sync_slow_git_long_timeout() {
+    # First sync
+    echo "$FUNCNAME 1" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 1"
 
     # run with slow_git but without timing out
     GIT_SYNC \
@@ -775,7 +798,7 @@ function e2e::sync_loop_timeout() {
 ##############################################
 # Test depth syncing
 ##############################################
-function e2e::depth() {
+function e2e::sync_depth_shallow() {
     # First sync
     echo "$FUNCNAME 1" > "$REPO"/file
     expected_depth="1"
@@ -825,7 +848,7 @@ function e2e::depth() {
 ##############################################
 # Test fetch skipping commit
 ##############################################
-function e2e::fetch_skip_depth_1() {
+function e2e::sync_fetch_skip_depth_1() {
     echo "$FUNCNAME" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME"
 
@@ -865,9 +888,9 @@ function e2e::fetch_skip_depth_1() {
 }
 
 ##############################################
-# Test password
+# Test password auth with the wrong password
 ##############################################
-function e2e::password() {
+function e2e::auth_password_wrong_password() {
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
 
@@ -885,34 +908,64 @@ function e2e::password() {
         >> "$1" 2>&1 || true
     # check for failure
     assert_file_absent "$ROOT"/link/file
+}
+
+##############################################
+# Test password auth with the correct password
+##############################################
+function e2e::auth_password_correct_password() {
+    echo "$FUNCNAME 1" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 1"
 
     # run with askpass_git with correct password
     GIT_SYNC \
         --git="$ASKPASS_GIT" \
         --username="my-username" \
         --password="my-password" \
-        --one-time \
+        --wait=0.1 \
         --repo="file://$REPO" \
         --branch="$MAIN_BRANCH" \
         --rev=HEAD \
         --root="$ROOT" \
         --dest="link" \
-        >> "$1" 2>&1
+        >> "$1" 2>&1 &
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+
+    # Move HEAD forward
+    echo "$FUNCNAME 2" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 2"
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 2"
+
+    # Move HEAD backward
+    git -C "$REPO" reset -q --hard HEAD^
+    sleep 3
     assert_link_exists "$ROOT"/link
     assert_file_exists "$ROOT"/link/file
     assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
 }
 
 ##############################################
-# Test askpass-url
+# Test askpass-url with bad password
 ##############################################
-function e2e::askpass_url() {
-    echo "$FUNCNAME 1" > "$REPO"/file
-    git -C "$REPO" commit -qam "$FUNCNAME 1"
+function e2e::auth_askpass_url_wrong_password() {
     # run the askpass-url service with wrong password
+    HITLOG="$WORK/hitlog"
+    cat /dev/null > "$HITLOG"
     CTR=$(docker_run \
+        -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'echo -e "HTTP/1.1 200 OK\r\n\r\nusername=my-username\npassword=wrong"')
+        80 'read X
+            echo "HTTP/1.1 200 OK"
+            echo
+            echo "username=my-username"
+            echo "password=wrong"
+            ')
     IP=$(docker_ip "$CTR")
 
     GIT_SYNC \
@@ -925,27 +978,120 @@ function e2e::askpass_url() {
         --root="$ROOT" \
         --dest="link" \
         >> "$1" 2>&1 || true
-    docker_kill "$CTR"
     # check for failure
     assert_file_absent "$ROOT"/link/file
+}
 
+##############################################
+# Test askpass-url
+##############################################
+function e2e::auth_askpass_url_correct_password() {
     # run with askpass_url service with correct password
+    HITLOG="$WORK/hitlog"
+    cat /dev/null > "$HITLOG"
     CTR=$(docker_run \
+        -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'echo -e "HTTP/1.1 200 OK\r\n\r\nusername=my-username\npassword=my-password"')
+        80 'read X
+            echo "HTTP/1.1 200 OK"
+            echo
+            echo "username=my-username"
+            echo "password=my-password"
+            ')
     IP=$(docker_ip "$CTR")
+
+    # First sync
+    echo "$FUNCNAME 1" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 1"
 
     GIT_SYNC \
         --git="$ASKPASS_GIT" \
         --askpass-url="http://$IP/git_askpass" \
-        --one-time \
+        --wait=0.1 \
         --repo="file://$REPO" \
         --branch="$MAIN_BRANCH" \
         --rev=HEAD \
         --root="$ROOT" \
         --dest="link" \
-        >> "$1" 2>&1
-    docker_kill "$CTR"
+        >> "$1" 2>&1 &
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+
+    # Move HEAD forward
+    echo "$FUNCNAME 2" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 2"
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 2"
+
+    # Move HEAD backward
+    git -C "$REPO" reset -q --hard HEAD^
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+}
+
+##############################################
+# Test askpass-url where the URL is flaky
+##############################################
+function e2e::auth_askpass_url_flaky() {
+    # run with askpass_url service which alternates good/bad replies.
+    HITLOG="$WORK/hitlog"
+    cat /dev/null > "$HITLOG"
+    CTR=$(docker_run \
+        -v "$HITLOG":/var/log/hits \
+        e2e/test/test-ncsvr \
+        80 'read X
+            echo "HTTP/1.1 200 OK"
+            echo
+            if [ -f /tmp/flag ]; then
+                echo "username=my-username"
+                echo "password=my-password"
+                rm /tmp/flag
+            else
+                echo "username=my-username"
+                echo "password=wrong"
+                touch /tmp/flag
+            fi
+            ')
+    IP=$(docker_ip "$CTR")
+
+    # First sync
+    echo "$FUNCNAME 1" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 1"
+
+    GIT_SYNC \
+        --git="$ASKPASS_GIT" \
+        --askpass-url="http://$IP/git_askpass" \
+        --max-sync-failures=2 \
+        --wait=0.1 \
+        --repo="file://$REPO" \
+        --branch="$MAIN_BRANCH" \
+        --rev=HEAD \
+        --root="$ROOT" \
+        --dest="link" \
+        >> "$1" 2>&1 &
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+
+    # Move HEAD forward
+    echo "$FUNCNAME 2" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 2"
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 2"
+
+    # Move HEAD backward
+    git -C "$REPO" reset -q --hard HEAD^
+    sleep 3
+
     assert_link_exists "$ROOT"/link
     assert_file_exists "$ROOT"/link/file
     assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
@@ -975,6 +1121,7 @@ function e2e::exechook_success() {
     assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
     assert_file_eq "$ROOT"/link/exechook "$FUNCNAME 1"
     assert_file_eq "$ROOT"/link/link-exechook "$FUNCNAME 1"
+    assert_file_eq "$ROOT"/link/exechook-env "$EXECHOOK_ENVKEY=$EXECHOOK_ENVVAL"
 
     # Move forward
     echo "$FUNCNAME 2" > "$REPO"/file
@@ -987,6 +1134,7 @@ function e2e::exechook_success() {
     assert_file_eq "$ROOT"/link/file "$FUNCNAME 2"
     assert_file_eq "$ROOT"/link/exechook "$FUNCNAME 2"
     assert_file_eq "$ROOT"/link/link-exechook "$FUNCNAME 2"
+    assert_file_eq "$ROOT"/link/exechook-env "$EXECHOOK_ENVKEY=$EXECHOOK_ENVVAL"
 }
 
 ##############################################
@@ -1041,6 +1189,7 @@ function e2e::exechook_success_once() {
     assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
     assert_file_eq "$ROOT"/link/exechook "$FUNCNAME 1"
     assert_file_eq "$ROOT"/link/link-exechook "$FUNCNAME 1"
+    assert_file_eq "$ROOT"/link/exechook-env "$EXECHOOK_ENVKEY=$EXECHOOK_ENVVAL"
 }
 
 ##############################################
@@ -1083,7 +1232,9 @@ function e2e::webhook_success() {
     CTR=$(docker_run \
         -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'echo -e "HTTP/1.1 200 OK\r\n"')
+        80 'read X
+            echo "HTTP/1.1 200 OK"
+           ')
     IP=$(docker_ip "$CTR")
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -1116,7 +1267,6 @@ function e2e::webhook_success() {
     if [[ "$HITS" < 1 ]]; then
         fail "webhook 2 called $HITS times"
     fi
-    docker_kill "$CTR"
 }
 
 ##############################################
@@ -1130,7 +1280,9 @@ function e2e::webhook_fail_retry() {
     CTR=$(docker_run \
         -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'echo -e "HTTP/1.1 500 Internal Server Error\r\n"')
+        80 'read X
+            echo "HTTP/1.1 500 Internal Server Error"
+           ')
     IP=$(docker_ip "$CTR")
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -1151,21 +1303,22 @@ function e2e::webhook_fail_retry() {
     if [[ "$HITS" < 1 ]]; then
         fail "webhook 1 called $HITS times"
     fi
-    docker_kill "$CTR"
 
     # Now return 200, ensure that it gets called
+    docker_kill "$CTR"
     cat /dev/null > "$HITLOG"
     CTR=$(docker_run \
         --ip="$IP" \
         -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'echo -e "HTTP/1.1 200 OK\r\n"')
+        80 'read X
+            echo "HTTP/1.1 200 OK"
+           ')
     sleep 2
     HITS=$(cat "$HITLOG" | wc -l)
     if [[ "$HITS" < 1 ]]; then
         fail "webhook 2 called $HITS times"
     fi
-    docker_kill "$CTR"
 }
 
 ##############################################
@@ -1179,7 +1332,10 @@ function e2e::webhook_success_once() {
     CTR=$(docker_run \
         -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'sleep 3 && echo -e "HTTP/1.1 200 OK\r\n"')
+        80 'read X
+            sleep 3
+            echo "HTTP/1.1 200 OK"
+           ')
     IP=$(docker_ip "$CTR")
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -1201,8 +1357,6 @@ function e2e::webhook_success_once() {
     if [[ "$HITS" != 1 ]]; then
         fail "webhook called $HITS times"
     fi
-
-    docker_kill "$CTR"
 }
 
 ##############################################
@@ -1216,7 +1370,10 @@ function e2e::webhook_fail_retry_once() {
     CTR=$(docker_run \
         -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'sleep 3 && echo -e "HTTP/1.1 500 Internal Server Error\r\n"')
+        80 'read X
+            sleep 3
+            echo "HTTP/1.1 500 Internal Server Error"
+           ')
     IP=$(docker_ip "$CTR")
     echo "$FUNCNAME 1" > "$REPO"/file
     git -C "$REPO" commit -qam "$FUNCNAME 1"
@@ -1238,7 +1395,6 @@ function e2e::webhook_fail_retry_once() {
     if [[ "$HITS" != 1 ]]; then
         fail "webhook called $HITS times"
     fi
-    docker_kill "$CTR"
 }
 
 ##############################################
@@ -1252,7 +1408,9 @@ function e2e::webhook_fire_and_forget() {
     CTR=$(docker_run \
         -v "$HITLOG":/var/log/hits \
         e2e/test/test-ncsvr \
-        80 'echo -e "HTTP/1.1 404 Not Found\r\n"')
+        80 'read X
+            echo "HTTP/1.1 404 Not Found"
+           ')
     IP=$(docker_ip "$CTR")
 
     # First sync
@@ -1275,13 +1433,12 @@ function e2e::webhook_fire_and_forget() {
     if [[ "$HITS" < 1 ]]; then
         fail "webhook called $HITS times"
     fi
-    docker_kill "$CTR"
 }
 
 ##############################################
 # Test http handler
 ##############################################
-function e2e::http() {
+function e2e::expose_http() {
     BINDPORT=8888
 
     # First sync
@@ -1331,7 +1488,7 @@ function e2e::http() {
 ##############################################
 # Test http handler after restart
 ##############################################
-function e2e::http_after_restart() {
+function e2e::expose_http_after_restart() {
     BINDPORT=8888
 
     echo "$FUNCNAME" > "$REPO"/file
@@ -1381,7 +1538,7 @@ function e2e::http_after_restart() {
 ##############################################
 # Test submodule sync
 ##############################################
-function e2e::submodule_sync() {
+function e2e::submodule_sync_default() {
     # Init submodule repo
     SUBMODULE_REPO_NAME="sub"
     SUBMODULE="$WORK/$SUBMODULE_REPO_NAME"
@@ -1637,7 +1794,7 @@ function e2e::submodule_sync_shallow() {
 ##############################################
 # Test SSH
 ##############################################
-function e2e::ssh() {
+function e2e::auth_ssh() {
     echo "$FUNCNAME" > "$REPO"/file
 
     # Run a git-over-SSH server
@@ -1648,8 +1805,12 @@ function e2e::ssh() {
     IP=$(docker_ip "$CTR")
     git -C "$REPO" commit -qam "$FUNCNAME"
 
+    # First sync
+    echo "$FUNCNAME 1" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 1"
+
     GIT_SYNC \
-        --one-time \
+        --wait=0.1 \
         --ssh \
         --ssh-known-hosts=false \
         --repo="test@$IP:/src" \
@@ -1657,10 +1818,26 @@ function e2e::ssh() {
         --rev=HEAD \
         --root="$ROOT" \
         --dest="link" \
-        >> "$1" 2>&1
+        >> "$1" 2>&1 &
+    sleep 3
     assert_link_exists "$ROOT"/link
     assert_file_exists "$ROOT"/link/file
-    assert_file_eq "$ROOT"/link/file "$FUNCNAME"
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
+
+    # Move HEAD forward
+    echo "$FUNCNAME 2" > "$REPO"/file
+    git -C "$REPO" commit -qam "$FUNCNAME 2"
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 2"
+
+    # Move HEAD backward
+    git -C "$REPO" reset -q --hard HEAD^
+    sleep 3
+    assert_link_exists "$ROOT"/link
+    assert_file_exists "$ROOT"/link/file
+    assert_file_eq "$ROOT"/link/file "$FUNCNAME 1"
 }
 
 ##############################################
@@ -1919,7 +2096,7 @@ if [[ "$#" == 0 ]]; then
 fi
 
 # Build it
-make container REGISTRY=e2e VERSION=$(make -s version)
+make container REGISTRY=e2e VERSION="${E2E_TAG}" ALLOW_STALE_APT=1
 make test-tools REGISTRY=e2e
 
 function finish() {
@@ -1952,5 +2129,9 @@ done
 
 # Finally...
 echo
-echo "cleaning up $DIR"
-rm -rf "$DIR"
+if [[ "${CLEANUP:-}" == 0 ]]; then
+    echo "leaving logs in $DIR"
+else
+    echo "cleaning up $DIR"
+    rm -rf "$DIR"
+fi

@@ -20,6 +20,7 @@ package main // import "k8s.io/git-sync/cmd/git-sync"
 
 import (
 	"context"
+	"crypto/md5"
 	"flag"
 	"fmt"
 	"io"
@@ -75,6 +76,9 @@ var flMaxSyncFailures = flag.Int("max-sync-failures", envInt("GIT_SYNC_MAX_SYNC_
 	"the number of consecutive failures allowed before aborting (the first sync must succeed, -1 will retry forever after the initial sync)")
 var flChmod = flag.Int("change-permissions", envInt("GIT_SYNC_PERMISSIONS", 0),
 	"the file permissions to apply to the checked-out files (0 will not change permissions at all)")
+var flSparseCheckoutFile = flag.String("sparse-checkout-file", envString("GIT_SYNC_SPARSE_CHECKOUT_FILE", ""),
+	"the path to a sparse-checkout file.")
+
 var flSyncHookCommand = flag.String("sync-hook-command", envString("GIT_SYNC_HOOK_COMMAND", ""),
 	"DEPRECATED: use --exechook-command instead")
 var flExechookCommand = flag.String("exechook-command", envString("GIT_SYNC_EXECHOOK_COMMAND", ""),
@@ -84,8 +88,6 @@ var flExechookTimeout = flag.Duration("exechook-timeout", envDuration("GIT_SYNC_
 	"the timeout for the command")
 var flExechookBackoff = flag.Duration("exechook-backoff", envDuration("GIT_SYNC_EXECHOOK_BACKOFF", time.Second*3),
 	"the time to wait before retrying a failed command")
-var flSparseCheckoutFile = flag.String("sparse-checkout-file", envString("GIT_SYNC_SPARSE_CHECKOUT_FILE", ""),
-	"the path to a sparse-checkout file.")
 
 var flWebhookURL = flag.String("webhook-url", envString("GIT_SYNC_WEBHOOK_URL", ""),
 	"the URL for a webhook notification when syncs complete (default is no webhook)")
@@ -120,7 +122,7 @@ var flCookieFile = flag.Bool("cookie-file", envBool("GIT_COOKIE_FILE", false),
 	"use git cookiefile")
 
 var flAskPassURL = flag.String("askpass-url", envString("GIT_ASKPASS_URL", ""),
-	"the URL for GIT_ASKPASS callback")
+	"the URL to query for a username and password for git auth")
 
 var flGitCmd = flag.String("git", envString("GIT_SYNC_GIT", "git"),
 	"the git command to run (subject to PATH search, mostly for testing)")
@@ -383,21 +385,25 @@ func main() {
 		}
 	}
 
+	// From here on, non-fatal output goes through logging.
+	log.V(0).Info("starting up", "pid", os.Getpid(), "args", os.Args)
+
 	// This context is used only for git credentials initialization. There are no long-running operations like
 	// `git clone`, so initTimeout set to 30 seconds should be enough.
 	ctx, cancel := context.WithTimeout(context.Background(), initTimeout)
+
+	// Set various configs we want, but users might override.
+	if err := setupDefaultGitConfigs(ctx); err != nil {
+		handleError(false, "ERROR: can't set default git configs: %v\n", err)
+	}
 
 	if *flUsername != "" {
 		if *flPasswordFile != "" {
 			passwordFileBytes, err := ioutil.ReadFile(*flPasswordFile)
 			if err != nil {
-				log.Error(err, "ERROR: can't read password file")
-				os.Exit(1)
+				handleError(false, "ERROR: can't read password file")
 			}
 			*flPassword = string(passwordFileBytes)
-		}
-		if err := setupGitAuth(ctx, *flUsername, *flPassword, *flRepo); err != nil {
-			handleError(false, "ERROR: can't create .netrc file: %v", err)
 		}
 	}
 
@@ -413,25 +419,10 @@ func main() {
 		}
 	}
 
-	if *flAskPassURL != "" {
-		if err := callGitAskPassURL(ctx, *flAskPassURL); err != nil {
-			askpassCount.WithLabelValues(metricKeyError).Inc()
-			handleError(false, "ERROR: failed to call ASKPASS callback URL: %v", err)
-		}
-		askpassCount.WithLabelValues(metricKeySuccess).Inc()
-	}
-
-	// Set additional configs we want, but users might override.
-	if err := setupDefaultGitConfigs(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: can't set default git configs: %v\n", err)
-		os.Exit(1)
-	}
-
 	// This needs to be after all other git-related config flags.
 	if *flGitConfig != "" {
 		if err := setupExtraGitConfigs(ctx, *flGitConfig); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: can't set additional git configs: %v\n", err)
-			os.Exit(1)
+			handleError(false, "ERROR: can't set additional git configs: %v\n", err)
 		}
 	}
 
@@ -468,9 +459,6 @@ func main() {
 			http.Serve(ln, mux)
 		}()
 	}
-
-	// From here on, output goes through logging.
-	log.V(0).Info("starting up", "pid", os.Getpid(), "args", os.Args)
 
 	// Startup webhooks goroutine
 	var webhookRunner *hook.HookRunner
@@ -513,22 +501,42 @@ func main() {
 		go exechookRunner.Run(context.Background())
 	}
 
+	// Craft a function that can be called to refresh credentials when needed.
+	refreshCreds := func(ctx context.Context) error {
+		// These should all be mutually-exclusive configs.
+		if *flUsername != "" {
+			if err := storeGitCredentials(ctx, *flUsername, *flPassword, *flRepo); err != nil {
+				return err
+			}
+		}
+		if *flAskPassURL != "" {
+			// When using an auth URL, the credentials can be dynamic, it needs to be
+			// re-fetched each time.
+			if err := callGitAskPassURL(ctx, *flAskPassURL); err != nil {
+				askpassCount.WithLabelValues(metricKeyError).Inc()
+				return err
+			}
+			askpassCount.WithLabelValues(metricKeySuccess).Inc()
+		}
+		return nil
+	}
+
 	initialSync := true
 	failCount := 0
 	for {
+		log.V(1).Info("syncing repo")
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*flSyncTimeout))
-		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, *flSubmodules); err != nil {
+		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, refreshCreds, *flSubmodules); err != nil {
+			failCount++
 			updateSyncMetrics(metricKeyError, start)
-			if *flMaxSyncFailures != -1 && failCount >= *flMaxSyncFailures {
+			if *flMaxSyncFailures != -1 && failCount > *flMaxSyncFailures {
 				// Exit after too many retries, maybe the error is not recoverable.
 				log.Error(err, "too many failures, aborting", "failCount", failCount)
 				os.Exit(1)
 			}
 
-			failCount++
-			log.Error(err, "unexpected error syncing repo, will retry")
-			log.V(0).Info("waiting before retrying", "waitTime", waitTime(*flWait))
+			log.Error(err, "error syncing repo, will retry", "failCount", failCount, "waitTime", waitTime(*flWait))
 			cancel()
 			time.Sleep(waitTime(*flWait))
 			continue
@@ -580,6 +588,9 @@ func main() {
 			initialSync = false
 		}
 
+		if failCount > 0 {
+			log.V(5).Info("resetting failure count", "failCount", failCount)
+		}
 		failCount = 0
 		log.DeleteErrorFile()
 		log.V(1).Info("next sync", "wait_time", waitTime(*flWait))
@@ -1028,16 +1039,8 @@ func revIsHash(ctx context.Context, rev, gitRoot string) (bool, error) {
 
 // syncRepo syncs the branch of a given repository to the destination at the given rev.
 // returns (1) whether a change occured, (2) the new hash, and (3) an error if one happened
-func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleMode string) (bool, string, error) {
-	if authURL != "" {
-		// For ASKPASS Callback URL, the credentials behind is dynamic, it needs to be
-		// re-fetched each time.
-		if err := callGitAskPassURL(ctx, authURL); err != nil {
-			askpassCount.WithLabelValues(metricKeyError).Inc()
-			return false, "", fmt.Errorf("failed to call GIT_ASKPASS_URL: %v", err)
-		}
-		askpassCount.WithLabelValues(metricKeySuccess).Inc()
-	}
+func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, refreshCreds func(context.Context) error, submoduleMode string) (bool, string, error) {
+	refreshCreds(ctx)
 
 	currentWorktreeGit := filepath.Join(dest, ".git")
 	var hash string
@@ -1097,16 +1100,18 @@ func getRevs(ctx context.Context, repo, localDir, branch, rev string) (string, s
 	return local, remote, nil
 }
 
-func setupGitAuth(ctx context.Context, username, password, gitURL string) error {
-	log.V(1).Info("setting up git credential store")
+func md5sum(s string) string {
+	h := md5.New()
+	io.WriteString(h, s)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
 
-	_, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, "config", "--global", "credential.helper", "store")
-	if err != nil {
-		return fmt.Errorf("can't configure git credential helper: %w", err)
-	}
+func storeGitCredentials(ctx context.Context, username, password, gitURL string) error {
+	log.V(3).Info("storing git credentials")
+	log.V(9).Info("md5 of credentials", "username", md5sum(username), "password", md5sum(password))
 
 	creds := fmt.Sprintf("url=%v\nusername=%v\npassword=%v\n", gitURL, username, password)
-	_, err = cmdRunner.RunWithStdin(ctx, "", nil, creds, *flGitCmd, "credential", "approve")
+	_, err := cmdRunner.RunWithStdin(ctx, "", nil, creds, *flGitCmd, "credential", "approve")
 	if err != nil {
 		return fmt.Errorf("can't configure git credentials: %w", err)
 	}
@@ -1132,7 +1137,7 @@ func setupGitSSH(setupKnownHosts bool) error {
 		}
 		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -o UserKnownHostsFile=%s -i %s", pathToSSHKnownHosts, pathToSSHSecret))
 	} else {
-		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s", pathToSSHSecret))
+		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -o StrictHostKeyChecking=no -i %s", pathToSSHSecret))
 	}
 
 	// set env variable GIT_SSH_COMMAND to force git use customized ssh command
@@ -1160,12 +1165,12 @@ func setupGitCookieFile(ctx context.Context) error {
 	return nil
 }
 
-// The expected ASKPASS callback output are below,
+// The expected URL callback output is below,
 // see https://git-scm.com/docs/gitcredentials for more examples:
 // username=xxx@example.com
 // password=xxxyyyzzz
 func callGitAskPassURL(ctx context.Context, url string) error {
-	log.V(1).Info("calling GIT_ASKPASS URL to get credentials")
+	log.V(2).Info("calling auth URL to get credentials")
 
 	var netClient = &http.Client{
 		Timeout: time.Second * 1,
@@ -1211,7 +1216,7 @@ func callGitAskPassURL(ctx context.Context, url string) error {
 		}
 	}
 
-	if err := setupGitAuth(ctx, username, password, *flRepo); err != nil {
+	if err := storeGitCredentials(ctx, username, password, *flRepo); err != nil {
 		return err
 	}
 
@@ -1227,6 +1232,10 @@ func setupDefaultGitConfigs(ctx context.Context) error {
 		// Fairly aggressive GC.
 		key: "gc.pruneExpire",
 		val: "now",
+	}, {
+		// How to manage credentials (for those modes that need it).
+		key: "credential.helper",
+		val: "cache --timeout 3600",
 	}}
 	for _, kv := range configs {
 		if _, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, "config", "--global", kv.key, kv.val); err != nil {
